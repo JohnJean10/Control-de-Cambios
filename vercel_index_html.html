@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Control de Cambios Inteligente</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0A0A0B; --panel: #131316; --border: #26262C; --border-s: #3A3A42;
+    --text: #F5F5F7; --sub: #A1A1AA; --dim: #71717A;
+    --accent: #C8F560; --accent-d: #9BC83A; --accent-bg: rgba(200,245,96,0.08);
+    --danger: #EF4444; --danger-bg: rgba(239,68,68,0.08);
+    --info: #60A5FA; --info-bg: rgba(96,165,250,0.08);
+  }
+  body { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  .fade-in { animation: fadeIn 0.3s ease; }
+  button { font-family: inherit; }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary { list-style: none; }
+  textarea:focus { border-color: var(--border-s) !important; outline: none; }
+  .spinner { width: 24px; height: 24px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  .spinner-sm { width: 14px; height: 14px; border: 2px solid rgba(0,0,0,0.2); border-top-color: #0A0A0B; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  .spinner-lg { width: 32px; height: 32px; border: 2.5px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+</style>
+</head>
+<body>
+<div id="app" style="max-width:1100px;margin:0 auto;padding:32px 28px"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docx-preview@0.3.3/dist/docx-preview.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+<script>
+const DEPTH_PROMPTS = {
+  "Sintético": "Identifica únicamente los cambios más críticos (máximo 5). Sé muy conciso.",
+  "Estándar": "Identifica todos los cambios relevantes con una justificación técnica clara.",
+  "Exhaustivo": "Realiza un análisis profundo de todos los cambios, incluyendo implicaciones operativas, de calidad y de cumplimiento normativo (ISO/Lean/5S cuando aplique)."
+};
+const MAX_CHARS = 60000, BATCH = 10, PAGE_H = 1122;
+
+const SYS_TEXT = (depth) => `Eres un experto en control documental industrial y gestión de calidad (ISO 9001, Lean Manufacturing, 5S). Compara dos versiones de un SOP o IT e identifica los cambios de contenido textual.
+
+ANTES DE ANALIZAR: Ignora cualquier sección titulada "Control de Cambios", "Historial de Revisiones", "Change Log" o similar. Analiza desde cero solo el contenido operativo y técnico.
+
+${DEPTH_PROMPTS[depth]}
+
+ESTILO DE REDACCIÓN OBLIGATORIO:
+- Verbos de acción en pasado: "Se redujo", "Se consolidó", "Se fusionó", "Se trasladó", "Se creó", "Se eliminó", "Se reestructuró", "Se simplificó", "Se actualizó", "Se depuró", "Se instituyó".
+- Cantidades concretas: "de 38 a 14 términos", "de 26 a 9 páginas".
+- Subsecciones entre paréntesis: "(4.1.1 – 4.1.5)".
+- Si contenido se movió a otro documento: "trasladando el contenido técnico a SOPs".
+- Nunca frases vagas como "se actualizó el contenido".
+
+EJEMPLO:
+"Se redujo el documento de 26 a 9 páginas, trasladando el contenido técnico y operativo a Procedimientos Operativos Estándar (SOPs)."
+"Se depuró la Sección 3. Definiciones, reduciendo de 38 a 14 términos clave vinculantes."
+"Se creó la nueva sección de Roles y Responsabilidades (4.1.1 – 4.1.5) para segregar formalmente las funciones entre áreas y usuarios."
+
+CAMPOS JSON:
+1. "seccion": número y título exacto de la sección.
+2. "descripcion": redacción completa siguiendo el estilo.
+3. "justificacion": motivo técnico, normativo u operativo.
+4. "tipo": siempre "contenido".
+
+Responde ÚNICAMENTE con JSON válido sin backticks:
+[{"seccion":"...","descripcion":"...","justificacion":"...","tipo":"contenido"}]
+Sin cambios: []`;
+
+const SYS_VISUAL = `Eres un experto en control documental. Analiza visualmente páginas de dos versiones y detecta ÚNICAMENTE cambios visuales: plantilla, encabezado, pie de página, logo, tablas, diagramas, formato (fuentes, márgenes, estilos, colores). NO analices cambios de texto/contenido.
+Usa verbos en pasado: "Se actualizó…", "Se rediseñó…", "Se eliminó…".
+CAMPOS:
+1. "seccion": "Página N" o el elemento visual.
+2. "descripcion": cambio visual detallado en pasado.
+3. "justificacion": impacto documental o normativo.
+4. "tipo": siempre "visual".
+Responde ÚNICAMENTE con JSON válido sin backticks:
+[{"seccion":"...","descripcion":"...","justificacion":"...","tipo":"visual"}]
+Sin cambios visuales: []`;
+
+// ── Extraction ──
+async function extractText(file) {
+  const n = file.name.toLowerCase();
+  if (n.endsWith(".pdf")) {
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    const pages = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      let lastY = null, line = [], lines = [];
+      for (const item of content.items) {
+        if (lastY !== null && Math.abs(item.transform[5] - lastY) > 2) { lines.push(line.join(" ")); line = []; }
+        line.push(item.str); lastY = item.transform[5];
+      }
+      if (line.length) lines.push(line.join(" "));
+      pages.push(`[Página ${i}]\n` + lines.filter(l => l.trim()).join("\n"));
+    }
+    return pages.join("\n\n").trim();
+  } else if (n.endsWith(".docx")) {
+    const buf = await file.arrayBuffer();
+    return (await mammoth.extractRawText({ arrayBuffer: buf })).value.trim();
+  }
+  throw new Error("Formato no soportado.");
+}
+
+async function pdfToImages(file, cb) {
+  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+  const imgs = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const vp = page.getViewport({ scale: 1.2 });
+    const c = document.createElement("canvas"); c.width = vp.width; c.height = vp.height;
+    await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+    imgs.push(c.toDataURL("image/jpeg", 0.7).split(",")[1]);
+    cb?.(i, pdf.numPages);
+  }
+  return imgs;
+}
+
+async function docxToImages(file, cb) {
+  const buf = await file.arrayBuffer();
+  const el = document.createElement("div");
+  Object.assign(el.style, { position: "fixed", left: "-9999px", top: "0", width: "794px", background: "#fff", color: "#000", fontFamily: "Times New Roman, serif", fontSize: "12pt", lineHeight: "1.4" });
+  document.body.appendChild(el);
+  try {
+    await docxPreview.renderAsync(buf, el, null, { className: "docx-preview", inWrapper: false, ignoreWidth: false, ignoreHeight: false, ignoreFonts: false, breakPages: true, renderHeaders: true, renderFooters: true, renderFootnotes: true });
+    await new Promise(r => setTimeout(r, 800));
+    const totalH = el.scrollHeight, numP = Math.max(1, Math.ceil(totalH / PAGE_H)), imgs = [];
+    for (let i = 0; i < numP; i++) {
+      cb?.(i + 1, numP);
+      const c = await html2canvas(el, { y: i * PAGE_H, height: Math.min(PAGE_H, totalH - i * PAGE_H), width: 794, windowWidth: 794, scale: 1.5, useCORS: true, backgroundColor: "#ffffff", logging: false });
+      imgs.push(c.toDataURL("image/jpeg", 0.7).split(",")[1]);
+    }
+    return imgs;
+  } finally { document.body.removeChild(el); }
+}
+
+async function fileToImages(file, cb) {
+  return file.name.toLowerCase().endsWith(".pdf") ? pdfToImages(file, cb) : docxToImages(file, cb);
+}
+
+// ── API ──
+async function callAPI(systemPrompt, content) {
+  const res = await fetch("/api/compare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ systemPrompt, content })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.text;
+}
+
+function parseJSON(raw) {
+  let c = raw.replace(/```json|```/g, "").trim();
+  const s = c.indexOf("[");
+  if (s === -1) return [];
+  c = c.substring(s);
+  const e = c.lastIndexOf("]");
+  if (e !== -1) c = c.substring(0, e + 1);
+  else { const lb = c.lastIndexOf("}"); c = lb !== -1 ? c.substring(0, lb + 1) + "]" : "[]"; }
+  try { return JSON.parse(c); } catch { return []; }
+}
+
+// ── State ──
+const state = {
+  v1: "", v2: "", file1: null, file2: null,
+  depth: "Estándar", visualMode: false,
+  loading: false, status: "", rp1: "", rp2: "",
+  results: null, error: "", copied: false
+};
+
+function setState(updates) {
+  Object.assign(state, updates);
+  render();
+}
+
+// ── Actions ──
+async function handleFile(which, file) {
+  if (!file) return;
+  setState({ [`file${which}`]: file, error: "" });
+  try {
+    const text = await extractText(file);
+    setState({ [`v${which}`]: text });
+  } catch (e) {
+    setState({ [`file${which}`]: null, error: e.message });
+  }
+}
+
+async function analyze() {
+  if (!state.v1.trim() || !state.v2.trim()) { setState({ error: "Por favor carga ambas versiones del documento." }); return; }
+  setState({ error: "", loading: true, results: null, status: "" });
+
+  try {
+    setState({ status: "Analizando cambios de contenido…" });
+    const t1 = state.v1.substring(0, MAX_CHARS), t2 = state.v2.substring(0, MAX_CHARS);
+    const textRaw = await callAPI(SYS_TEXT(state.depth), `VERSIÓN ANTERIOR (V1):\n${t1}\n\n---\n\nVERSIÓN NUEVA (V2):\n${t2}`);
+    const textResults = parseJSON(textRaw);
+
+    let visualResults = [];
+    if (state.visualMode && state.file1 && state.file2) {
+      setState({ status: "Renderizando V1…" });
+      const imgs1 = await fileToImages(state.file1, (i, t) => setState({ rp1: `${i}/${t}` }));
+      setState({ rp1: "", status: "Renderizando V2…" });
+      const imgs2 = await fileToImages(state.file2, (i, t) => setState({ rp2: `${i}/${t}` }));
+      setState({ rp2: "" });
+
+      const maxP = Math.max(imgs1.length, imgs2.length);
+      for (let b = 0; b < maxP; b += BATCH) {
+        const end = Math.min(b + BATCH, maxP);
+        setState({ status: `Analizando visualmente (${b + 1}–${end} de ${maxP})…` });
+        const parts = [{ type: "text", text: `Compara visualmente páginas ${b + 1}–${end}.\n\nVERSIÓN ANTERIOR (V1):` }];
+        imgs1.slice(b, end).forEach((d, i) => { parts.push({ type: "text", text: `V1 Pág ${b + i + 1}:` }); parts.push({ type: "image", data: d }); });
+        parts.push({ type: "text", text: `VERSIÓN NUEVA (V2):` });
+        imgs2.slice(b, end).forEach((d, i) => { parts.push({ type: "text", text: `V2 Pág ${b + i + 1}:` }); parts.push({ type: "image", data: d }); });
+        const vRaw = await callAPI(SYS_VISUAL, parts);
+        visualResults.push(...parseJSON(vRaw));
+      }
+    }
+    setState({ results: [...textResults, ...visualResults], loading: false, status: "" });
+  } catch (e) {
+    setState({ error: e.message, loading: false, status: "" });
+  }
+}
+
+function copyForWord() {
+  if (!state.results?.length) return;
+  const plantilla = state.results.find(r => r.tipo === "visual" && r.descripcion.toLowerCase().includes("plantilla"));
+  let out = plantilla ? "Se actualizó la plantilla del documento.\n\n" : "";
+  out += state.results.map((r, i) => `${i + 1}. ${r.descripcion}`).join("\n");
+  navigator.clipboard.writeText(out);
+  setState({ copied: true });
+  setTimeout(() => setState({ copied: false }), 2000);
+}
+
+function exportCSV() {
+  if (!state.results?.length) return;
+  const esc = s => `"${(s || "").replace(/"/g, '""')}"`;
+  const rows = state.results.map(r => [esc(r.tipo), esc(r.seccion), esc(r.descripcion), esc(r.justificacion)].join(","));
+  const blob = new Blob(["\uFEFF" + "Tipo,Sección,Descripción,Justificación\n" + rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "control_de_cambios.csv" }).click();
+}
+
+// ── Render ──
+function render() {
+  const { v1, v2, file1, file2, depth, visualMode, loading, status, rp1, rp2, results, error, copied } = state;
+  const canGo = v1.trim() && v2.trim() && !loading;
+  const vr = results?.filter(r => r.tipo === "visual") || [];
+
+  function dropZone(which, label, badge, file, text, rp) {
+    const id = `drop${which}`;
+    const inputId = `file${which}`;
+    return `
+    <div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span style="font-size:11px;font-weight:600;color:var(--dim);letter-spacing:0.8px;text-transform:uppercase">${badge}</span>
+        <span style="font-size:13px;font-weight:500;color:var(--text)">${label}</span>
+      </div>
+      <div id="${id}" style="border:1.5px dashed ${file ? 'var(--border-s)' : 'var(--border)'};border-radius:12px;background:var(--panel);padding:20px 16px;text-align:center;cursor:pointer;min-height:110px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;transition:all 0.18s">
+        <input type="file" id="${inputId}" accept=".pdf,.docx" style="display:none">
+        ${rp ? `<div class="spinner"></div><span style="font-size:13px;color:var(--sub)">Renderizando ${rp}</span>`
+          : file ? `
+            <div style="width:36px;height:36px;border-radius:8px;background:var(--accent-bg);display:flex;align-items:center;justify-content:center">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13h6M9 17h6"/></svg>
+            </div>
+            <span style="font-size:13px;font-weight:500;color:var(--text);word-break:break-all;padding:0 8px">${file.name}</span>
+            <span style="font-size:11px;color:var(--dim)">Haz clic para cambiar</span>`
+          : `
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--dim)" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+            <span style="font-size:13px;color:var(--sub)">Arrastra el archivo o haz clic</span>
+            <span style="font-size:11px;color:var(--dim)">PDF · DOCX</span>`}
+      </div>
+      ${text ? `<details style="margin-top:8px"><summary style="font-size:11px;color:var(--dim);cursor:pointer;padding:4px 0;user-select:none">Ver texto extraído (${text.length.toLocaleString()} caracteres)</summary><textarea id="textarea${which}" style="width:100%;height:90px;resize:vertical;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:11px;color:var(--sub);font-family:ui-monospace,SFMono-Regular,monospace;line-height:1.5;margin-top:6px">${text.replace(/</g,'&lt;')}</textarea></details>` : ''}
+    </div>`;
+  }
+
+  function depthBtn(d) {
+    const active = depth === d;
+    return `<button onclick="setState({depth:'${d}'})" style="padding:6px 14px;font-size:13px;font-weight:500;border-radius:7px;border:none;background:${active ? 'var(--accent)' : 'transparent'};color:${active ? '#0A0A0B' : 'var(--sub)'};cursor:pointer">${d}</button>`;
+  }
+
+  function badge(text, bg, color, border) {
+    return `<span style="font-size:11px;font-weight:600;padding:3px 10px;border-radius:6px;background:${bg};color:${color}${border ? `;border:1px solid ${border}` : ''}">${text}</span>`;
+  }
+
+  function typeBadge(tipo) {
+    const isV = tipo === "visual";
+    return `<span style="font-size:10px;font-weight:600;padding:3px 8px;border-radius:5px;letter-spacing:0.4px;text-transform:uppercase;background:${isV ? 'var(--info-bg)' : 'var(--accent-bg)'};color:${isV ? 'var(--info)' : 'var(--accent-d)'};border:1px solid ${isV ? 'rgba(96,165,250,0.25)' : 'rgba(200,245,96,0.25)'}">${isV ? 'Visual' : 'Contenido'}</span>`;
+  }
+
+  let resultsHTML = '';
+  if (results !== null && !loading) {
+    if (results.length === 0) {
+      resultsHTML = `<div style="padding:48px 20px;text-align:center;font-size:14px;color:var(--sub);background:var(--panel);border-radius:14px;border:1px solid var(--border)">No se detectaron cambios significativos entre las versiones.</div>`;
+    } else {
+      const tableRows = results.map((r, i) => `
+        <tr style="border-bottom:${i < results.length - 1 ? '1px solid var(--border)' : 'none'}">
+          <td style="padding:14px 16px;color:var(--dim);font-size:12px;vertical-align:top;font-weight:500">${i + 1}</td>
+          <td style="padding:14px 16px;vertical-align:top">${typeBadge(r.tipo)}</td>
+          <td style="padding:14px 16px;font-weight:500;vertical-align:top;line-height:1.5">${r.seccion}</td>
+          <td style="padding:14px 16px;vertical-align:top;line-height:1.6">${r.descripcion}</td>
+          <td style="padding:14px 16px;vertical-align:top;line-height:1.6;color:var(--sub);font-size:12px">${r.justificacion}</td>
+        </tr>`).join('');
+
+      const narrativeItems = results.map(r =>
+        `<li style="font-size:13px;line-height:1.75;color:var(--text);padding-left:18px;position:relative;margin-bottom:6px">
+          <span style="position:absolute;left:0;color:var(--accent)">—</span>
+          ${r.tipo === 'visual' ? '<span style="font-size:10px;font-weight:600;margin-right:8px;color:var(--info);padding:1px 6px;border-radius:4px;background:var(--info-bg);letter-spacing:0.4px">VISUAL</span>' : ''}${r.descripcion}
+        </li>`).join('');
+
+      resultsHTML = `
+        <div class="fade-in">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
+            <div style="display:flex;align-items:center;gap:10px">
+              <h2 style="font-size:17px;font-weight:600;margin:0">Registro de cambios</h2>
+              ${badge(results.length, 'var(--accent)', '#0A0A0B')}
+              ${vr.length > 0 ? badge(`${vr.length} visual${vr.length !== 1 ? 'es' : ''}`, 'var(--info-bg)', 'var(--info)', 'rgba(96,165,250,0.25)') : ''}
+            </div>
+            <div style="display:flex;gap:8px">
+              <button onclick="copyForWord()" style="font-size:13px;padding:7px 14px;border-radius:8px;border:1px solid ${copied ? 'var(--accent)' : 'var(--border)'};background:${copied ? 'var(--accent-bg)' : 'var(--panel)'};color:${copied ? 'var(--accent)' : 'var(--text)'};cursor:pointer;display:flex;align-items:center;gap:6px;font-weight:500">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${copied ? '<path d="M20 6L9 17l-5-5"/>' : '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>'}</svg>
+                ${copied ? 'Copiado' : 'Copiar para Word'}
+              </button>
+              <button onclick="exportCSV()" style="font-size:13px;padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;display:flex;align-items:center;gap:6px;font-weight:500">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>CSV
+              </button>
+            </div>
+          </div>
+          <div style="background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;margin-bottom:20px">
+            <table style="width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed">
+              <thead><tr style="background:var(--bg)">
+                <th style="padding:12px 16px;text-align:left;font-weight:600;color:var(--dim);font-size:11px;letter-spacing:0.6px;text-transform:uppercase;border-bottom:1px solid var(--border);width:36px">#</th>
+                <th style="padding:12px 16px;text-align:left;font-weight:600;color:var(--dim);font-size:11px;letter-spacing:0.6px;text-transform:uppercase;border-bottom:1px solid var(--border);width:80px">Tipo</th>
+                <th style="padding:12px 16px;text-align:left;font-weight:600;color:var(--dim);font-size:11px;letter-spacing:0.6px;text-transform:uppercase;border-bottom:1px solid var(--border);width:18%">Sección</th>
+                <th style="padding:12px 16px;text-align:left;font-weight:600;color:var(--dim);font-size:11px;letter-spacing:0.6px;text-transform:uppercase;border-bottom:1px solid var(--border)">Descripción</th>
+                <th style="padding:12px 16px;text-align:left;font-weight:600;color:var(--dim);font-size:11px;letter-spacing:0.6px;text-transform:uppercase;border-bottom:1px solid var(--border);width:28%">Justificación</th>
+              </tr></thead>
+              <tbody>${tableRows}</tbody>
+            </table>
+          </div>
+          <div style="padding:20px 24px;border:1px solid var(--border);border-radius:14px;background:var(--panel)">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+              <span style="font-size:11px;font-weight:600;color:var(--dim);letter-spacing:0.8px;text-transform:uppercase">Resumen narrativo</span>
+            </div>
+            <ul style="margin:0;padding:0;list-style:none">${narrativeItems}</ul>
+          </div>
+        </div>`;
+    }
+  }
+
+  document.getElementById("app").innerHTML = `
+    <header style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none"><rect x="2" y="2" width="24" height="24" rx="6" stroke="var(--accent)" stroke-width="1.5"/><path d="M9 11h10M9 14h7M9 17h10" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"/><circle cx="20" cy="14" r="1.5" fill="var(--accent)"/></svg>
+      <div>
+        <h1 style="font-size:20px;font-weight:600;margin:0;letter-spacing:-0.3px">Control de Cambios Inteligente</h1>
+        <p style="font-size:13px;color:var(--dim);margin:2px 0 0">Trazabilidad documental asistida por IA</p>
+      </div>
+    </header>
+    <div style="height:1px;background:var(--border);margin:24px 0 28px"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:28px">
+      ${dropZone(1, "Versión Anterior", "V1", file1, v1, rp1)}
+      ${dropZone(2, "Versión Nueva", "V2", file2, v2, rp2)}
+    </div>
+    <div style="background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:20px">
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:11px;font-weight:600;color:var(--dim);letter-spacing:0.8px;text-transform:uppercase">Profundidad</span>
+          <div style="display:inline-flex;padding:3px;background:var(--panel);border-radius:10px;border:1px solid var(--border)">${depthBtn("Sintético")}${depthBtn("Estándar")}${depthBtn("Exhaustivo")}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:11px;font-weight:600;color:var(--dim);letter-spacing:0.8px;text-transform:uppercase">Modo extendido</span>
+          <div onclick="setState({visualMode:!state.visualMode})" style="display:flex;align-items:center;gap:10px;padding:8px 14px;border-radius:10px;border:1px solid ${visualMode ? 'var(--border-s)' : 'var(--border)'};background:${visualMode ? 'var(--accent-bg)' : 'var(--panel)'};cursor:pointer">
+            <div style="width:32px;height:18px;border-radius:9px;background:${visualMode ? 'var(--accent)' : 'var(--border)'};position:relative;transition:background 0.2s;flex-shrink:0">
+              <div style="position:absolute;top:2px;left:${visualMode ? '16px' : '2px'};width:14px;height:14px;border-radius:50%;background:${visualMode ? '#0A0A0B' : '#fff'};transition:left 0.2s"></div>
+            </div>
+            <div><span style="font-size:13px;color:var(--text);font-weight:500;display:block">Análisis visual</span><span style="font-size:10px;color:var(--dim)">Plantilla, tablas, formato (PDF y DOCX)</span></div>
+          </div>
+        </div>
+        <button onclick="analyze()" ${canGo ? '' : 'disabled'} style="margin-left:auto;margin-top:18px;padding:11px 24px;font-size:14px;font-weight:600;border-radius:10px;background:${canGo ? 'var(--accent)' : 'var(--panel)'};color:${canGo ? '#0A0A0B' : 'var(--dim)'};border:1px solid ${canGo ? 'var(--accent)' : 'var(--border)'};cursor:${canGo ? 'pointer' : 'not-allowed'};display:flex;align-items:center;gap:8px">
+          ${loading ? '<div class="spinner-sm"></div>Procesando' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Comparar con IA'}
+        </button>
+      </div>
+    </div>
+    ${error ? `<div class="fade-in" style="padding:14px 18px;border-radius:12px;font-size:13px;background:var(--danger-bg);color:var(--danger);border:1px solid rgba(239,68,68,0.25);margin-bottom:20px;display:flex;align-items:flex-start;gap:10px;line-height:1.5"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:2px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>${error}</span></div>` : ''}
+    ${loading ? `<div class="fade-in" style="text-align:center;padding:60px 20px;color:var(--sub);background:var(--panel);border:1px solid var(--border);border-radius:14px"><div class="spinner-lg"></div><div style="font-size:14px;font-weight:500;color:var(--text)">${status || 'Procesando…'}</div><div style="font-size:12px;color:var(--dim);margin-top:6px">Esto puede tomar varios segundos</div></div>` : ''}
+    ${resultsHTML}
+    <footer style="margin-top:40px;padding-top:20px;border-top:1px solid var(--border);font-size:11px;color:var(--dim);text-align:center">Powered by Gemini · Control documental inteligente</footer>
+  `;
+
+  // Bind events
+  [1, 2].forEach(w => {
+    const drop = document.getElementById(`drop${w}`);
+    const input = document.getElementById(`file${w}`);
+    if (drop && input) {
+      drop.onclick = () => input.click();
+      input.onchange = (e) => handleFile(w, e.target.files[0]);
+      drop.ondragover = (e) => { e.preventDefault(); drop.style.borderColor = 'var(--accent)'; drop.style.background = 'var(--accent-bg)'; };
+      drop.ondragleave = () => { drop.style.borderColor = 'var(--border)'; drop.style.background = 'var(--panel)'; };
+      drop.ondrop = (e) => { e.preventDefault(); drop.style.borderColor = 'var(--border)'; drop.style.background = 'var(--panel)'; handleFile(w, e.dataTransfer.files[0]); };
+    }
+    const ta = document.getElementById(`textarea${w}`);
+    if (ta) ta.oninput = () => { state[`v${w}`] = ta.value; };
+  });
+}
+
+// Init
+render();
+</script>
+</body>
+</html>
